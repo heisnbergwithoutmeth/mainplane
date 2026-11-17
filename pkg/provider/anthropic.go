@@ -136,7 +136,9 @@ func (e anthropic) Compile(req Request) ([]byte, Cache, error) {
 			if err != nil {
 				return nil, Cache{}, err
 			}
-			body.Messages = append(body.Messages, anthMsg{Role: "assistant", Content: content})
+			if len(content) > 0 {
+				body.Messages = append(body.Messages, anthMsg{Role: "assistant", Content: content})
+			}
 			continue
 		}
 		blocks := anthUser(t.Records)
