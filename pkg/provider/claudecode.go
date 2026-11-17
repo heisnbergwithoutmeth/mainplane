@@ -167,7 +167,9 @@ func (e claudeCode) Compile(req Request) ([]byte, Cache, error) {
 			if err != nil {
 				return nil, Cache{}, err
 			}
-			body.Frames = append(body.Frames, f)
+			if c, ok := f.Message.Content.([]any); ok && len(c) > 0 {
+				body.Frames = append(body.Frames, f)
+			}
 			continue
 		}
 		f := ccFrame{Type: "user", Message: anthMsg{Role: "user", Content: anthUser(t.Records)}}
