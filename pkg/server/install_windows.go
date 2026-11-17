@@ -116,7 +116,10 @@ func (s service) Execute(_ []string, reqs <-chan svc.ChangeRequest, status chan<
 // code runs unelevated as them, reads and edits the config and keys. A
 // protected DACL drops every entry an earlier install or someone else left on
 // Dir, and an empty unprotected one on each child drops its own, so it
-// inherits Dir's alone.
+// inherits Dir's alone. A link or reparse point under Dir — which someone with
+// write access there could plant, since a junction needs no symlink
+// privilege — is refused before the LocalSystem harness writes session state
+// through it.
 func prepare() error {
 	if err := stop(); err != nil {
 		return err
@@ -139,16 +142,31 @@ func prepare() error {
 	if err := windows.SetNamedSecurityInfo(Dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
 		return err
 	}
-	if sd, err = windows.SecurityDescriptorFromString("D:"); err != nil {
+	return resetChildACLs(Dir)
+}
+
+// resetChildACLs drops each child's own DACL so it inherits Dir's alone: an
+// empty, unprotected one makes every explicit ACE on a child vanish. A link
+// or reparse point under Dir is refused first, so the LocalSystem harness
+// never writes session state through a planted junction into an attacker's
+// directory. On Go >= 1.23 a directory junction reports fs.ModeIrregular, not
+// fs.ModeDir, so WalkDir does not descend into it; the check covers
+// fs.ModeSymlink too, since an NTFS symlink under Dir is the same threat.
+func resetChildACLs(dir string) error {
+	sd, err := windows.SecurityDescriptorFromString("D:")
+	if err != nil {
 		return err
 	}
 	empty, _, err := sd.DACL()
 	if err != nil {
 		return err
 	}
-	return filepath.WalkDir(Dir, func(p string, _ fs.DirEntry, err error) error {
-		if err != nil || p == Dir {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == dir {
 			return err
+		}
+		if d.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
+			return fmt.Errorf("%s is a link or reparse point, which the harness never makes; remove it", p)
 		}
 		return windows.SetNamedSecurityInfo(p, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION, nil, nil, empty, nil)
 	})
