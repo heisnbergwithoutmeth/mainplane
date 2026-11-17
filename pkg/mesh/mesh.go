@@ -192,15 +192,7 @@ func Up(dir, harness, url, secret, name string) (*Mesh, error) {
 			return true
 		})
 		if removed {
-			log.Printf("mesh: the harness removed this worker; leaving the mesh. To join again: install with the network name and device code")
-			if err := os.WriteFile(filepath.Join(dir, Removed), nil, 0o600); err != nil {
-				log.Printf("mesh: %v", err)
-			}
-			unwatch()
-			if err := m.leave(); err != nil {
-				log.Printf("mesh: %v", err)
-			}
-			close(m.removed)
+			m.harnessRemoved(dir)
 		}
 	}()
 	go func() {
@@ -257,13 +249,16 @@ func (m *Mesh) Peer(name string) (netip.Addr, bool) {
 }
 
 // Close leaves the mesh: the status socket, the hosts block go, the router
-// takes its address, route and rule away, and the TUN goes.
+// takes its address, route and rule away, and the TUN goes. It waits for
+// follow to end first, which would otherwise call lb.Start after Shutdown
+// and resurrect a control client nothing can stop; Logout does the same.
 func (m *Mesh) Close() error {
 	if m.sock != nil {
 		_ = m.sock.Close()
 	}
 	m.unwatch()
 	<-m.watched
+	<-m.follows
 	return m.leave()
 }
 
@@ -278,13 +273,37 @@ func (m *Mesh) Logout() error {
 	return m.lb.Logout(ctx, ipnauth.Self)
 }
 
-// leave shuts the node down, once, and removes the hosts block.
+// leave shuts the node down, once, and removes the hosts block. The caller
+// has already drained follow; otherwise a follow tick past its select could
+// call lb.Start after Shutdown and install a control client this leaves.
 func (m *Mesh) leave() error {
 	m.left.Do(func() {
 		m.lb.Shutdown()
 		m.err = hosts("")
 	})
 	return m.err
+}
+
+// harnessRemoved is the harness-removal tear-down, called from Up's
+// watcher once the coordinator marked this worker NeedsMachineAuth and
+// WatchNotifications returned. It writes the Removed anchor at dir for
+// an uninstall+reinstall to drop, drains follow (which would register
+// the node again — and, once the backend's Shutdown latches, would
+// install a fresh control client nothing ever stops), leaves the mesh
+// and finally closes m.removed: the worker process keeps running after
+// this returns, so a resurrected client here would map-poll the harness
+// indefinitely. Close's drain follows the same order.
+func (m *Mesh) harnessRemoved(dir string) {
+	log.Printf("mesh: the harness removed this worker; leaving the mesh. To join again: install with the network name and device code")
+	if err := os.WriteFile(filepath.Join(dir, Removed), nil, 0o600); err != nil {
+		log.Printf("mesh: %v", err)
+	}
+	m.unwatch()
+	<-m.follows
+	if err := m.leave(); err != nil {
+		log.Printf("mesh: %v", err)
+	}
+	close(m.removed)
 }
 
 // Clean removes what a killed worker left: the hosts block, a status socket
