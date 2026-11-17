@@ -183,7 +183,7 @@ func Handler(ctx context.Context, h *Harness) http.Handler {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	handle("DELETE /sessions/{id}", h.serveDelete)
+	handle("DELETE /sessions/{id}", func(w http.ResponseWriter, r *http.Request) { h.serveDelete(ctx, w, r) })
 	handle("PUT /sessions/{id}/workers", h.serveWorkers)
 	handle("PUT /sessions/{id}/name", h.serveName)
 	h.agentRoutes(ctx, mux, handle)
@@ -234,7 +234,7 @@ func (h *Harness) agentRoutes(ctx context.Context, mux *http.ServeMux, handle fu
 		}
 		return h.Stop(ctx, a.live(), via)
 	})
-	act("DELETE /agents/{id}", func(r *http.Request, id, via string) error { return h.DeleteAgent(r.Context(), id, via) })
+	act("DELETE /agents/{id}", func(r *http.Request, id, via string) error { return h.DeleteAgent(ctx, id, via) })
 	act("PUT /agents/{id}/name", func(r *http.Request, id, via string) error {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -411,13 +411,16 @@ func (h *Harness) serveWorkers(w http.ResponseWriter, r *http.Request) {
 	reply(w, map[string]int{"n": n})
 }
 
-func (h *Harness) serveDelete(w http.ResponseWriter, r *http.Request) {
+// serveDelete is DELETE /sessions/{id} under the long-lived Handler ctx, not
+// the request's: a client disconnect during the stop must not abort the
+// delete.
+func (h *Harness) serveDelete(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	via, err := via(r)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	if err := h.Delete(r.Context(), r.PathValue("id"), via); err != nil {
+	if err := h.Delete(ctx, r.PathValue("id"), via); err != nil {
 		fail(w, err)
 		return
 	}

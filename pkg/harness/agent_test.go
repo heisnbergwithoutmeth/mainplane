@@ -982,3 +982,157 @@ func TestMadeUpIDs(t *testing.T) {
 		t.Fatalf("%d locks and %d files for agents that are not", n, len(entries))
 	}
 }
+
+// runningStep makes id look like a session mid-step: a runner goroutine that
+// is stepping it and never ends on its own, which is what halt's wait
+// selects on. A real step's teardown can outlast any HTTP client's patience;
+// this stands in for one without running a model. It returns the runner's
+// done channel, to close when the runner should end.
+func (r *rig) runningStep(id string) chan struct{} {
+	s := r.h.session(id)
+	r.h.mu.Lock()
+	s.running, s.cancel, s.done = true, func() {}, make(chan struct{})
+	done := s.done
+	r.h.mu.Unlock()
+	return done
+}
+
+// deletingStill passes only if s.deleting stays set for the whole window. A
+// delete that aborts on request cancellation would clear it within
+// milliseconds; this lets a fix prove it outlives the request without a flaky
+// fixed sleep on the happy path.
+func deletingStill(t *testing.T, h *Harness, s *session, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		still := s.deleting
+		h.mu.Unlock()
+		if !still {
+			t.Fatal("the delete aborted when its request was canceled; it should outlive the request")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestDeleteAgentSurvivesCancel: a DELETE /agents/{id} whose client goes away
+// while the delete waits for the agent's live session's run to end runs to
+// completion anyway. The route runs under the long-lived Handler ctx, not the
+// request's, so a request cancellation does not abort it: the agent goes and
+// the documented final kick runs. Before the fix the route passed
+// r.Context(), so a disconnect aborted the delete after the agent's file and
+// registry entries were already removed — the agent was irreversibly gone
+// yet the caller was told the delete failed, the final kick was skipped, and
+// a retrying client got 404.
+func TestDeleteAgentSurvivesCancel(t *testing.T) {
+	r := newRig(t)
+	t.Cleanup(func() { close(r.release) })
+	srv := httptest.NewServer(Handler(context.Background(), r.h))
+	defer srv.Close()
+	a := r.create(AgentCreate{Config: r.conf(1000, 0, "w1")}, "web")
+	s := r.h.session(a.Sessions[0])
+	done := r.runningStep(a.Sessions[0])
+
+	req, _ := http.NewRequest("DELETE", srv.URL+"/agents/"+a.ID+"?via=test", nil)
+	reqCtx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(reqCtx)
+	defer cancel()
+	res := make(chan error, 1)
+	go func() { _, err := http.DefaultClient.Do(req); res <- err }()
+
+	// the delete enters halt's wait once deleting is set; by then the agent's
+	// file and registry entries are already gone
+	r.until(func() bool {
+		r.h.mu.Lock()
+		defer r.h.mu.Unlock()
+		return s.deleting
+	})
+	if _, err := os.Stat(filepath.Join(r.h.Agents, a.ID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("agent file not removed before the wait: %v", err)
+	}
+
+	// the client gives up mid-wait. With the fix the delete keeps waiting on
+	// the runner; without it, halt would return ctx.Err() and release deleting
+	cancel()
+	<-res
+	deletingStill(t, r.h, s, 200*time.Millisecond)
+
+	// the runner ends; the delete runs to completion, including the final kick
+	close(done)
+	r.until(func() bool {
+		r.h.mu.Lock()
+		defer r.h.mu.Unlock()
+		return !s.deleting
+	})
+	if _, err := r.h.Agent(a.ID); !errors.Is(err, ErrNoAgent) {
+		t.Fatalf("agent after a canceled delete: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.h.Agents, a.ID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("agent file after a canceled delete: %v", err)
+	}
+	// the documented final kick ran: a kick during a run marks the session to
+	// look once more, which is what would step a post that landed during the
+	// hold. A buggy delete skipped it.
+	r.until(func() bool {
+		r.h.mu.Lock()
+		defer r.h.mu.Unlock()
+		return s.kicked
+	})
+}
+
+// TestDeleteSessionSurvivesCancel: a DELETE /sessions/{id} whose client goes
+// away while the delete waits for the session's run to end runs to completion
+// anyway. The route runs under the long-lived Handler ctx, not the request's,
+// so a request cancellation does not abort it: the session file is removed.
+// Before the fix the route passed r.Context(), so a disconnect aborted the
+// delete before the file was removed — the caller was told the delete failed
+// and a merely-stopped session was left behind (a retry would succeed, so
+// this is the milder of the two).
+func TestDeleteSessionSurvivesCancel(t *testing.T) {
+	r := newRig(t)
+	t.Cleanup(func() { close(r.release) })
+	srv := httptest.NewServer(Handler(context.Background(), r.h))
+	defer srv.Close()
+	id, err := r.h.Create(context.Background(), Create{Model: "fake/m1", ContextLimit: 1000}, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := r.h.session(id)
+	done := r.runningStep(id)
+
+	req, _ := http.NewRequest("DELETE", srv.URL+"/sessions/"+id+"?via=test", nil)
+	reqCtx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(reqCtx)
+	defer cancel()
+	res := make(chan error, 1)
+	go func() { _, err := http.DefaultClient.Do(req); res <- err }()
+
+	// the delete enters halt's wait once deleting is set
+	r.until(func() bool {
+		r.h.mu.Lock()
+		defer r.h.mu.Unlock()
+		return s.deleting
+	})
+
+	// the client gives up mid-wait; with the fix the delete keeps waiting
+	cancel()
+	<-res
+	deletingStill(t, r.h, s, 200*time.Millisecond)
+
+	// the runner ends; the delete removes the session file and unindexes it
+	close(done)
+	r.until(func() bool {
+		r.h.mu.Lock()
+		defer r.h.mu.Unlock()
+		return !s.deleting
+	})
+	if _, err := r.h.Sessions.Load(id); err == nil {
+		t.Fatal("the session file is still there after the delete")
+	}
+	r.h.mu.Lock()
+	_, gone := r.h.s[id]
+	r.h.mu.Unlock()
+	if gone {
+		t.Fatal("the session is still in the index after the delete")
+	}
+}
