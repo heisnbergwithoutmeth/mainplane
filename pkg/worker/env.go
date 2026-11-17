@@ -109,10 +109,19 @@ func (e *env) run(ctx context.Context, code, mark string, emit func([]byte) erro
 	if e.it.wrap != nil {
 		code = e.it.wrap(code)
 	}
-	if _, err := fmt.Fprintf(e.in, "%s\n%s\n", code, fmt.Sprintf(e.it.done, mark)); err != nil {
-		e.wait()
-		return e.cmd.ProcessState.ExitCode(), false, nil
-	}
+	// Write the code and the done line while the read loop below drains
+	// stdout, so a script larger than the pipe buffer whose early commands
+	// emit more than the buffer does not deadlock the writer on a full
+	// stdout pipe. stdin is left open: the interpreter persists between runs
+	// and reads the next run after the done line. The buffered channel keeps
+	// the goroutine from leaking; the deferred receive waits it out so the
+	// next run on this env does not race it for stdin.
+	writeErr := make(chan error, 1)
+	defer func() { <-writeErr }()
+	go func() {
+		_, werr := fmt.Fprintf(e.in, "%s\n%s\n", code, fmt.Sprintf(e.it.done, mark))
+		writeErr <- werr
+	}()
 	var buf, line []byte
 	flush := func() error {
 		if len(buf) == 0 {
