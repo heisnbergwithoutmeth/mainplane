@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -24,9 +25,60 @@ import (
 // store false. The step record's request hash stays the full body's: the
 // delta is transport only.
 //
-// The server ends a socket at 60 minutes; socketLife opens a new one before,
-// so a step does not fail on the limit.
+// The server ends a socket at 60 minutes; socketLife opens a new one before a
+// step when it can. A step that straddles the cutoff the check cannot bound
+// hits the limit mid-stream: socketLimitError marks that teardown, so the
+// harness recovers on a fresh socket instead of failing the session.
 const socketLife = 55 * time.Minute
+
+// socketLimitError marks the 60-minute Responses WebSocket cap. OpenAI's docs
+// name two faces of the same cutoff, and either reaches here: a close frame
+// (StatusGoingAway, reason naming the limit) or an error event (type "error",
+// code "websocket_connection_limit_reached", status 400). It unwraps to the
+// underlying error so transient and readers see their closest reading. A
+// retry's fresh socket is its recovery, but the cut step has already emitted,
+// so Step's terminal-after-emission gate is left to stand and the harness
+// retries on a new step id whose built context drops the orphaned blocks.
+type socketLimitError struct{ err error }
+
+func (e *socketLimitError) Error() string { return e.err.Error() }
+func (e *socketLimitError) Unwrap() error { return e.err }
+
+// IsSocketLimit reports whether err is the 60-minute Responses WebSocket cap.
+// The harness uses it as a reconnection point: a fresh step id and a redial
+// resend the step's input whole. Anything else, a network blip included,
+// keeps the path it always had.
+func IsSocketLimit(err error) bool {
+	var sle *socketLimitError
+	return errors.As(err, &sle)
+}
+
+// socketLimit reports whether err carries the documented signature of the
+// 60-minute teardown. The envelope surfaces the close frame in a wrapped
+// websocket.CloseError and the error event's raw body in its message, so both
+// faces reach this check with the strings and code the server emits.
+func socketLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		// The cutoff's close is the endpoint-going-away code (a 60-minute cap is
+		// a planned teardown, and a proxy may strip the reason). A reason that
+		// names the limit matches on its own, in case a server uses a custom
+		// code. Other close codes stay on their own path: a network blip is
+		// transient under unrelated errors.
+		if ce.Code == websocket.StatusGoingAway ||
+			strings.Contains(strings.ToLower(ce.Reason), "60 minute") ||
+			strings.Contains(strings.ToLower(ce.Reason), "connection limit") {
+			return true
+		}
+	}
+	// The error event's body holds the documented code as a literal; the
+	// envelope surfaces raw bytes, whether the read path took it as an httpError
+	// (a fresh step, unchained) or as the envelope's own error (a chained one).
+	return strings.Contains(err.Error(), "websocket_connection_limit_reached")
+}
 
 // Conn is a session's socket, kept from step to step while the session steps.
 // The zero value has none; a failed step closes it, and the next step opens a
@@ -52,11 +104,16 @@ func (c *Conn) Close() {
 
 // socket is one attempt over the session's socket, the WebSocket twin of once.
 // A continuation that fails is not httpError, so it is retried, whole, on a
-// new socket: the server may have dropped the response it chained from.
+// new socket: the server may have dropped the response it chained from. A
+// failure that hits the 60-minute cap is wrapped as socketLimitError, so the
+// harness retries past the terminal-after-emission gate on a fresh socket.
 func (p Provider) socket(ctx context.Context, c *Conn, url, session string, body []byte, emit func(statefile.Record)) (h statefile.Header, emitted bool, err error) {
 	defer func() {
 		if err != nil {
 			c.Close()
+			if socketLimit(err) {
+				err = &socketLimitError{err: err}
+			}
 		}
 	}()
 	var fields map[string]json.RawMessage

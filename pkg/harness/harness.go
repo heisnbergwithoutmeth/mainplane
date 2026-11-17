@@ -39,6 +39,14 @@ const (
 	resume   = "Continue"
 )
 
+// socketLimitRetries bounds the harness's recovery from OpenAI's 60-minute
+// Responses WebSocket cap. A step cut mid-stream reconnects on a fresh socket
+// with a fresh step id; the cut step's emitted blocks have no record closing
+// them and so drop from the rebuilt context, the recovery OpenAI's docs name.
+// Two is enough for the cutoff (one reconnect) and ignores a network blip that
+// masks itself as the limit, while bounding the run a runaway blip could cost.
+const socketLimitRetries = 2
+
 type Harness struct {
 	Sessions  statefile.Sessions
 	Providers map[string]provider.Provider // read and replaced under pmu once the harness runs
@@ -419,7 +427,10 @@ func errorRecord(via, text string) statefile.Record {
 // step is one provider call: blocks as they stream, the step record, then a
 // result for every call. A stop cancels ctx: the stream ends without a step
 // record, every call not yet answered gets a stopped result, and the last
-// record is an error naming who stopped it.
+// record is an error naming who stopped it. A step OpenAI's 60-minute
+// WebSocket cap cuts mid-stream is retried on a fresh socket with a fresh
+// step id: the cut step's emitted blocks are orphaned (no step record closes
+// them) and statefile.Build drops them, so the redial resends the input whole.
 func (h *Harness) step(ctx context.Context, s *session, id string, conf statefile.Conf, chain []statefile.Record) (statefile.Status, error) {
 	p, model, err := h.provider(conf.Model)
 	if err != nil {
@@ -441,67 +452,72 @@ func (h *Harness) step(ctx context.Context, s *session, id string, conf statefil
 		case statefile.Start, statefile.Config, statefile.System, statefile.Message, statefile.Text, statefile.Thinking, statefile.Call, statefile.Error, statefile.Name:
 		}
 	}
-	stepID := statefile.NewID()
-	var calls []statefile.Record
-	var appendErr error
 	req := provider.Request{Model: model, Key: chain[0].ID, Tools: Tools(conf.Tools, conf.Input), Context: records, Params: conf.Params}
-	hdr, err := p.Step(ctx, &s.conn, req, func(r statefile.Record) {
-		r.Step = stepID
-		if r.ID == "" {
-			r.ID = statefile.NewID()
+	for attempt := 0; ; attempt++ {
+		stepID := statefile.NewID()
+		var calls []statefile.Record
+		var appendErr error
+		hdr, err := p.Step(ctx, &s.conn, req, func(r statefile.Record) {
+			r.Step = stepID
+			if r.ID == "" {
+				r.ID = statefile.NewID()
+			}
+			if r.Kind == statefile.Call {
+				calls = append(calls, r)
+			}
+			if appendErr == nil {
+				_, appendErr = h.append(s, r)
+			}
+		})
+		if appendErr != nil {
+			return "", appendErr
 		}
-		if r.Kind == statefile.Call {
-			calls = append(calls, r)
+		if err != nil {
+			if via := s.stoppedBy(); via != "" {
+				_, err := h.append(s, errorRecord(via, fmt.Sprintf(halted, via)))
+				return statefile.StatusFailed, err
+			}
+			if provider.IsSocketLimit(err) && attempt < socketLimitRetries {
+				continue
+			}
+			_, err := h.append(s, errorRecord("", err.Error()+rebuilt(p, model, conf, chain)))
+			return statefile.StatusFailed, err
 		}
-		if appendErr == nil {
-			_, appendErr = h.append(s, r)
+		hdr.Kind, hdr.ID, hdr.Upto, hdr.Harness = statefile.Step, stepID, upto, version.V
+		if _, err := h.append(s, statefile.Record{Header: hdr}); err != nil {
+			return "", err
 		}
-	})
-	if appendErr != nil {
-		return "", appendErr
-	}
-	if err != nil {
+		// the same model only: a copy may go on with another, which counts tokens its own way
+		short := hdr.Provider == floor.Provider && hdr.Model == floor.Model && hdr.Usage.Prompt() > 0 && hdr.Usage.Prompt() < floor.Usage.Prompt()
+		for _, c := range calls {
+			r := result(c.ID, "not run")
+			if ctx.Err() == nil && !short {
+				r = h.execute(ctx, id, conf, c)
+				if ctx.Err() != nil {
+					r = result(c.ID, "stopped, effect unknown")
+				}
+			}
+			if _, err := h.append(s, r); err != nil {
+				return "", err
+			}
+		}
 		if via := s.stoppedBy(); via != "" {
 			_, err := h.append(s, errorRecord(via, fmt.Sprintf(halted, via)))
 			return statefile.StatusFailed, err
 		}
-		_, err := h.append(s, errorRecord("", err.Error()+rebuilt(p, model, conf, chain)))
-		return statefile.StatusFailed, err
-	}
-	hdr.Kind, hdr.ID, hdr.Upto, hdr.Harness = statefile.Step, stepID, upto, version.V
-	if _, err := h.append(s, statefile.Record{Header: hdr}); err != nil {
-		return "", err
-	}
-	// the same model only: a copy may go on with another, which counts tokens its own way
-	short := hdr.Provider == floor.Provider && hdr.Model == floor.Model && hdr.Usage.Prompt() > 0 && hdr.Usage.Prompt() < floor.Usage.Prompt()
-	for _, c := range calls {
-		r := result(c.ID, "not run")
-		if ctx.Err() == nil && !short {
-			r = h.execute(ctx, id, conf, c)
-			if ctx.Err() != nil {
-				r = result(c.ID, "stopped, effect unknown")
-			}
+		if short {
+			_, err := h.append(s, errorRecord("", fmt.Sprintf(cut, hdr.Usage.Prompt(), floor.Usage.Prompt())))
+			return statefile.StatusFailed, err
 		}
-		if _, err := h.append(s, r); err != nil {
-			return "", err
+		if len(calls) == 0 && !provider.Normal(hdr) {
+			_, err := h.append(s, errorRecord("", fmt.Sprintf(abnormal, hdr.Stop, hdr.Usage.Output)))
+			return statefile.StatusFailed, err
 		}
+		if len(calls) == 0 {
+			return statefile.StatusClosed, nil
+		}
+		return statefile.StatusOpen, nil
 	}
-	if via := s.stoppedBy(); via != "" {
-		_, err := h.append(s, errorRecord(via, fmt.Sprintf(halted, via)))
-		return statefile.StatusFailed, err
-	}
-	if short {
-		_, err := h.append(s, errorRecord("", fmt.Sprintf(cut, hdr.Usage.Prompt(), floor.Usage.Prompt())))
-		return statefile.StatusFailed, err
-	}
-	if len(calls) == 0 && !provider.Normal(hdr) {
-		_, err := h.append(s, errorRecord("", fmt.Sprintf(abnormal, hdr.Stop, hdr.Usage.Output)))
-		return statefile.StatusFailed, err
-	}
-	if len(calls) == 0 {
-		return statefile.StatusClosed, nil
-	}
-	return statefile.StatusOpen, nil
 }
 
 // clock gives the model time and context from the file alone, never the
