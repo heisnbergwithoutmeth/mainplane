@@ -64,14 +64,57 @@ type Table map[string][]Entry
 // entry counts at once.
 type Store struct{ Path string }
 
-// writes holds each read and rewrite of a table whole, so two at once in
-// this process, such as two POST /keys, never drop an entry, and a Check
-// never reads a table half written. The table is rewritten in place, not
-// renamed over, since root writes it at install and the file must stay the
-// harness user's.
+// writes holds each read and rewrite of a table whole within this process,
+// so two at once, such as two POST /keys, never drop an entry. A second
+// process writes the same table too: the root CLI's key new/revoke, which
+// elevates to root. The in-process RWMutex cannot reach across a process
+// boundary, so acquire adds a cross-process lock on a sibling file. The
+// table is rewritten in place, not renamed over, since root writes it at
+// install and the file must stay the harness user's.
 var writes sync.RWMutex
 
+// acquire opens the lock file beside the table and holds an advisory lock
+// on it, exclusive when write is true and shared otherwise, until the
+// returned release function is called. The harness service and the root
+// CLI are two processes that read-modify-write the same auth.json; a Check
+// takes the lock shared and an Issue/Add/Revoke exclusive, so across
+// processes no reader sees a table a writer is mid-save on, and two
+// writers (two POST /keys, or a POST /keys racing a key revoke) never drop
+// each other's updates. The lock is a flock on Unix and a LockFileEx on
+// Windows, both on auth.json.lock in the harness's 0o700 directory, so
+// only the harness user and root (which the CLI elevates to) reach it.
+func (s Store) acquire(write bool) (func(), error) {
+	p := s.Path + ".lock"
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockFile(f, s.Path, write); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() { _ = f.Close() }, nil
+}
+
+// Load is the table at the store's path, exclusive of any writer: a reader
+// (key list) takes the read lock pair, so a writer mid-save never shows a
+// torn file.
 func (s Store) Load() (Table, error) {
+	writes.RLock()
+	defer writes.RUnlock()
+	release, err := s.acquire(false)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return s.load()
+}
+
+// load is the table at the store's path; the caller holds the locks.
+func (s Store) load() (Table, error) {
 	t := Table{}
 	b, err := os.ReadFile(s.Path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -98,7 +141,12 @@ func (s Store) save(t Table) error {
 func (s Store) Issue(kind, name string) (string, error) {
 	writes.Lock()
 	defer writes.Unlock()
-	t, err := s.Load()
+	release, err := s.acquire(true)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	t, err := s.load()
 	if err != nil {
 		return "", err
 	}
@@ -114,7 +162,12 @@ func (s Store) Issue(kind, name string) (string, error) {
 func (s Store) Add(kind, name, secret string) error {
 	writes.Lock()
 	defer writes.Unlock()
-	t, err := s.Load()
+	release, err := s.acquire(true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	t, err := s.load()
 	if err != nil {
 		return err
 	}
@@ -125,7 +178,12 @@ func (s Store) Add(kind, name, secret string) error {
 func (s Store) Revoke(kind, name string) error {
 	writes.Lock()
 	defer writes.Unlock()
-	t, err := s.Load()
+	release, err := s.acquire(true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	t, err := s.load()
 	if err != nil {
 		return err
 	}
@@ -140,8 +198,14 @@ func (s Store) Revoke(kind, name string) error {
 // Check is whether secret is a live entry of kind.
 func (s Store) Check(kind, secret string) bool {
 	writes.RLock()
-	t, err := s.Load()
-	writes.RUnlock()
+	defer writes.RUnlock()
+	release, err := s.acquire(false)
+	if err != nil {
+		log.Printf("auth: %v", err)
+		return false
+	}
+	defer release()
+	t, err := s.load()
 	if err != nil {
 		log.Printf("auth: %v", err)
 		return false
