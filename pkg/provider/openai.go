@@ -103,6 +103,7 @@ type respTool struct {
 type respPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
+	Refusal  string `json:"refusal,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
 	Detail   string `json:"detail,omitempty"`
 }
@@ -262,6 +263,7 @@ func respRecord(raw json.RawMessage) (statefile.Record, bool, error) {
 	case "message":
 		for _, p := range item.Content {
 			r.Body = append(r.Body, p.Text...)
+			r.Body = append(r.Body, p.Refusal...)
 		}
 		if len(r.Body) == 0 {
 			return r, false, nil
