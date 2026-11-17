@@ -168,7 +168,7 @@ type chatCallBody struct {
 
 func (e openaiChat) Compile(req Request) ([]byte, Cache, error) {
 	system, rest := Split(req.Context)
-	rest = fit(e.Name(), rest, chatLimits)
+	rest = fit(e.Name(), rest, chatLimits, images)
 	body := chatReq{Model: req.Model, Stream: true, StreamOptions: chatStreamOptions{IncludeUsage: true}, CacheKey: req.Key, Messages: []chatMsg{}}
 	var cache Cache // other vendors: prompt_cache_key routes to the prefix the server caches itself
 	var mark *anthCache

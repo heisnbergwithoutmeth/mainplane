@@ -130,7 +130,7 @@ var cachePoint = &bedCachePoint{Type: "default", TTL: "1h"}
 // Claude models only, as it does.
 func (e bedrock) Compile(req Request) ([]byte, Cache, error) {
 	system, rest := Split(req.Context)
-	rest = fit(e.Name(), rest, bedLimits)
+	rest = fit(e.Name(), rest, bedLimits, images)
 	body := bedReq{Messages: []bedMsg{}}
 	mark := claude(req.Model)
 	var cache Cache

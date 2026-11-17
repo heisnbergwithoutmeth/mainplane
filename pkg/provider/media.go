@@ -73,20 +73,43 @@ var fitCache = struct {
 	bytes int
 }{m: map[fitKey]fitted{}}
 
-// fit holds the images of rest under l, so an image the harness took never
-// makes a later request invalid, and never changes an image sent before it.
-// Records keep their bytes; each image is fit from its own record alone, so
-// the request is a pure function of the records and grows only at its end.
-// An image over a side, pixel or byte limit is scaled and re-encoded, and
-// the model is told the size it sees. An image that does not decode goes as
-// text saying so. Once the next image would take the request past l.Count
-// or l.Request, it and every image after it go as text: the session's images
-// are full, and a new session takes more.
-func fit(name string, rest []statefile.Record, l Limits) []statefile.Record {
+// fit holds the media of rest under l, so media the harness took never makes
+// a later request invalid, and never changes media sent before it. media is
+// the types the envelope inlines: a record of any other type passes through.
+// Records keep their bytes; each is fit from its own record alone, so the
+// request is a pure function of the records and grows only at its end. An
+// image over a side, pixel or byte limit is scaled and re-encoded, and the
+// model is told the size it sees; an image that does not decode goes as text
+// saying so. Non-image media the envelope inlines cannot be re-encoded, so a
+// record over l.Bytes degrades to text without spending the budget. Once the
+// next record would take the request past l.Count or l.Request, it and every
+// record after it go as text: the session's media is full, and a new session
+// takes more.
+func fit(name string, rest []statefile.Record, l Limits, media []string) []statefile.Record {
 	out := make([]statefile.Record, 0, len(rest))
 	count, sum, full := 0, 0, false
 	for _, r := range rest {
+		if !slices.Contains(media, r.Type) {
+			out = append(out, r)
+			continue
+		}
 		if !slices.Contains(images, r.Type) {
+			// Non-image media the envelope inlines cannot be re-encoded: a
+			// record over Bytes degrades to text without spending the budget,
+			// and once Count or Request is reached it and every later record
+			// degrade too.
+			over := len(r.Body) > l.Bytes
+			if !full && !over {
+				full = count+1 > l.Count || sum+len(r.Body) > l.Request
+			}
+			switch {
+			case full:
+				r.Type, r.Body = "text/plain", fmt.Appendf(nil, "[media not sent: this session is at %s's media limit of %d media or %d MB per request. Continue in a new session to see more media.]", name, l.Count, l.Request/1_000_000)
+			case over:
+				r.Type, r.Body = "text/plain", fmt.Appendf(nil, "[media not sent: %s over %s's %d MB per-record limit.]", r.Type, name, l.Bytes/1_000_000)
+			default:
+				count, sum = count+1, sum+len(r.Body)
+			}
 			out = append(out, r)
 			continue
 		}
