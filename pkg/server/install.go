@@ -165,10 +165,20 @@ func Install(c *Config, keep bool) error {
 		return err
 	}
 	if c.NoAdmin { // an admin worker an earlier install made goes
-		if h, _, err := mesh.Joined(); err == nil && h == pointer.Encode(k) {
-			return uninstallAdmin()
+		// mesh.Joined() errs with mesh.ErrNoWorker when no worker daemon runs,
+		// and with a generic error when one runs but has not yet received its
+		// first netmap: it serves its control socket at once but answers
+		// "joined" only after a live round-trip to the harness, so the same
+		// error also covers a worker that was never joined or was revoked. A
+		// live answer naming a different harness leaves that worker be: it is
+		// not this install's to remove. In every other case a worker on disk
+		// is one a previous install of this harness made; uninstallAdmin is a
+		// no-op when worker.Bin is gone, so a machine that was never a worker
+		// still reports success.
+		if h, _, err := mesh.Joined(); err == nil && h != pointer.Encode(k) {
+			return nil
 		}
-		return nil
+		return uninstallAdmin()
 	}
 	if err := admin(k); err != nil {
 		return err
