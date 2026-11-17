@@ -105,6 +105,16 @@ func chatgptToken(ctx context.Context, dir string) (string, error) {
 	}
 	t, err := postToken(ctx, neturl.Values{"grant_type": {"refresh_token"}, "client_id": {c.ClientID}, "refresh_token": {c.RefreshToken}, "resource": {resource}})
 	if err != nil {
+		if code, ok := refreshDone(err); ok {
+			// The refresh token is dead; clear it so the next call reads
+			// "not signed in" and recovers, instead of failing the same way.
+			// The client id and host id stay: a re-login reuses the saved
+			// client, as OpenAI's docs require. A save failure loses the
+			// invalidation, but the re-login message already names the fix.
+			c.AccessToken, c.RefreshToken = "", ""
+			_ = saveCreds(dir, c)
+			return "", configError{fmt.Errorf("chatgpt: sign-in expired (%s): mainplane signin <provider>", code)}
+		}
 		return "", err
 	}
 	c.AccessToken, c.RefreshToken, c.Scope, c.Expires = t.AccessToken, t.RefreshToken, t.Scope, time.Now().Add(time.Duration(t.ExpiresIn)*time.Second)
@@ -112,6 +122,31 @@ func chatgptToken(ctx context.Context, dir string) (string, error) {
 		c.IDToken = t.IDToken
 	}
 	return c.AccessToken, saveCreds(dir, c)
+}
+
+// refreshDone reports whether err is a refresh refusal OpenAI's docs treat as
+// disconnection: an httpError whose body's {"error": code} is one of the
+// terminal refresh codes (invalid_grant, invalid_refresh_token, token_expired,
+// refresh_token_expired, refresh_token_invalidated, refresh_token_reused).
+// invalid_client instead names a client-configuration problem the user must
+// fix in the config, not a re-login, so it is left to pass through. The
+// matched code is returned for the message. See
+// https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery.
+func refreshDone(err error) (string, bool) {
+	var he *httpError
+	if !errors.As(err, &he) {
+		return "", false
+	}
+	var bod struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(he.body, &bod) != nil {
+		return "", false
+	}
+	if slices.Contains([]string{"invalid_grant", "invalid_refresh_token", "token_expired", "refresh_token_expired", "refresh_token_invalidated", "refresh_token_reused"}, bod.Error) {
+		return bod.Error, true
+	}
+	return "", false
 }
 
 // postToken calls the token endpoint. A refusal is an httpError, so a 400
