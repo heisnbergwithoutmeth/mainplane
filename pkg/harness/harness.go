@@ -49,6 +49,7 @@ type Harness struct {
 	Agents    string                             // the directory of agents/<id>.json
 	Skill     func(app string) (string, bool)    // line 1 of an app's skill, if the harness has the app
 	Stopped   func(a Agent, st statefile.Status) // an agent's live session ended a run closed or failed; a rollover is not one
+	adoptHook func()                             // nil in production; a test seam paused inside the adopt path while the agent's lock is held
 
 	pmu sync.RWMutex
 	mu  sync.Mutex

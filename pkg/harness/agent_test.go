@@ -982,3 +982,99 @@ func TestMadeUpIDs(t *testing.T) {
 		t.Fatalf("%d locks and %d files for agents that are not", n, len(entries))
 	}
 }
+
+// Adoptions of a running session serialize with that session's handoff. The
+// adopt path claims the session and takes the agent's lock before the claim
+// is visible, then holds it across note and save; a step that hands off takes
+// the same lock through holdAgent, so its rollover cannot roll and save
+// between the adopt's claim and adopt's save and then be overwritten by the
+// stale local copy. A test seam widens the claim-to-save window so the race is
+// deterministic rather than scheduler-luck: with the lock the handoff blocks
+// and the final chain is [x, next]; without it the handoff rolls and the
+// adopt's stale save clobbers it back to [x], orphaning the continuation.
+func TestAdoptRacesHandoff(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	r.step = func(body string) turn {
+		if strings.Contains(body, "hit its limit mid-task") {
+			return turn{input: 100}
+		}
+		return turn{code: "wait", input: 1500}
+	}
+	x, err := r.h.Create(ctx, Create{Model: "fake/m1", ContextLimit: 1000, Workers: []statefile.Worker{{Name: "w1"}}}, "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.h.Post(ctx, x, "test", "", []Part{{Type: "text/plain", Body: []byte("start")}}); err != nil {
+		t.Fatal(err)
+	}
+	<-r.started // x is mid-step, its wait tool held by the worker
+
+	adoptProceed, adopted := make(chan struct{}), make(chan struct{})
+	r.h.adoptHook = func() { <-adoptProceed }
+	go func() {
+		_, err = r.h.CreateAgent(ctx, AgentCreate{Session: x}, "web")
+		close(adopted)
+	}()
+
+	// the claim is published and the adopt path is paused inside the lock
+	r.until(func() bool { _, ok := r.h.Holder(x); return ok })
+	held, _ := r.h.Holder(x)
+	if len(held.Sessions) != 1 || held.Sessions[0] != x {
+		t.Fatalf("claim before save: %v", held.Sessions)
+	}
+
+	// let x's step finish and reach its limit, which hands off; the handoff
+	// reaches the agent's lock through holdAgent. With the adopt path holding
+	// the lock the rollover blocks; without it the rollover runs and the
+	// adopt's stale save would later clobber it back to [x].
+	close(r.release)
+	r.until(func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return slices.Contains(r.events, "kill "+x)
+	})
+	for end := time.Now().Add(time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		if got := r.sessions(held.ID); len(got) == 2 {
+			t.Fatalf("handoff rolled while the adoption still holds its stale copy: %v", got)
+		}
+	}
+	if got := r.sessions(held.ID); len(got) != 1 || got[0] != x {
+		t.Fatalf("handoff state: %v, want [x] (blocked on the adoption's lock)", got)
+	}
+
+	// release the adopt path: note and save run under the lock, then the
+	// blocked handoff proceeds and rolls x -> next
+	close(adoptProceed)
+	<-adopted
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// the continuation took over and ran to a close, not an orphaned failure
+	r.settled(held.ID)
+	r.until(func() bool { r.mu.Lock(); defer r.mu.Unlock(); return len(r.stopped) > 0 })
+	r.mu.Lock()
+	stops := slices.Clone(r.stopped)
+	r.mu.Unlock()
+
+	got := r.sessions(held.ID)
+	if len(got) != 2 || got[0] != x || got[1] == x {
+		t.Fatalf("after the race: sessions %v, want [x next]", got)
+	}
+	next := got[1]
+	if _, ok := r.h.Holder(x); ok {
+		t.Fatal("x still holds the key after the rollover")
+	}
+	if h, ok := r.h.Holder(next); !ok || h.ID != held.ID {
+		t.Fatalf("the continuation does not hold the key: agent %s holder %v ok %v", held.ID, h, ok)
+	}
+	var onDisk Agent
+	b, derr := os.ReadFile(filepath.Join(r.h.Agents, held.ID+".json"))
+	if derr != nil || json.Unmarshal(b, &onDisk) != nil || !slices.Equal(onDisk.Sessions, got) {
+		t.Fatalf("disk does not match memory: %s err=%v want %v", b, derr, got)
+	}
+	if want := next + " " + string(statefile.StatusClosed); !slices.Equal(stops, []string{want}) {
+		t.Fatalf("stops: %v, want [%s]", stops, want)
+	}
+}
