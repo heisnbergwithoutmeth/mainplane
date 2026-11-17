@@ -263,42 +263,92 @@ func smbServer(shares string, users map[string]string, op *user.User) error {
 	return nil
 }
 
+// smbStatus is `smbstatus --shares --json`: the tree connects clients
+// hold, keyed by id.
+type smbStatus struct {
+	Tcons map[string]smbTcon `json:"tcons"`
+}
+
+// smbTcon is one tree connect: service the share, machine the client's
+// address, server_id the smbd process the files sit on.
+type smbTcon struct {
+	Service  string      `json:"service"`
+	Machine  string      `json:"machine"`
+	ServerID smbServerID `json:"server_id"`
+}
+
+// smbServerID is the smbd process a tcon sits on.
+type smbServerID struct {
+	Pid string `json:"pid"`
+}
+
+// smbCloseCmd is one tree connect to end: service the share, pid the
+// smbd process to tell.
+type smbCloseCmd struct {
+	service string
+	pid     string
+}
+
 // smbClose ends at once each client's connection to a share it may no
 // longer use: smbd checks valid users only when a client connects to a
 // share, and Windows keeps that connection while the mapping lasts. A
-// client is known by its mesh address.
+// client is known by its mesh address. Only a drive share this server
+// exports is revocable; a tree connect to anything else smbd
+// auto-registers — IPC$, which every Windows client opens for
+// named-pipe traffic — is left alone, instead of being torn down each
+// round and reopened by the client. A close that fails, most often
+// because the smbd child behind it has just exited, is logged, not
+// returned: the outcome is the one wanted, and only smbstatus's own
+// failure is fatal, so a dead child does not fail this round's drives.
 func smbClose(es []Export) error {
+	out, err := exec.Command("smbstatus", "--configfile="+smbConf, "--shares", "--json").Output()
+	if err != nil {
+		return fmt.Errorf("smbstatus: %w", err)
+	}
+	var st smbStatus
+	if err := json.Unmarshal(out, &st); err != nil {
+		return fmt.Errorf("smbstatus: %w", err)
+	}
+	closeShares(smbCloses(es, st.Tcons), func(service, pid string) error {
+		return run("smbcontrol", "--configfile="+smbConf, pid, "close-share", service)
+	})
+	return nil
+}
+
+// smbCloses is the tree connects smbClose should end: those to a drive
+// share this server exports from a client no longer among its valid
+// users. A tree connect to a share we do not export — IPC$, or anything
+// else smbd auto-registers — is never ours to revoke and is left alone.
+func smbCloses(es []Export, tcons map[string]smbTcon) []smbCloseCmd {
 	ok := map[string]bool{}
+	services := map[string]bool{}
 	for _, e := range es {
+		services[e.Name] = true
 		for _, c := range e.Clients {
 			if c.SMB != nil {
 				ok[e.Name+" "+c.Addr.String()] = true
 			}
 		}
 	}
-	out, err := exec.Command("smbstatus", "--configfile="+smbConf, "--shares", "--json").Output()
-	if err != nil {
-		return fmt.Errorf("smbstatus: %w", err)
-	}
-	var st struct {
-		Tcons map[string]struct {
-			Service  string `json:"service"`
-			Machine  string `json:"machine"`
-			ServerID struct {
-				Pid string `json:"pid"`
-			} `json:"server_id"`
-		} `json:"tcons"`
-	}
-	if err := json.Unmarshal(out, &st); err != nil {
-		return fmt.Errorf("smbstatus: %w", err)
-	}
-	var errs []error
-	for _, t := range st.Tcons {
-		if !ok[t.Service+" "+t.Machine] {
-			errs = append(errs, run("smbcontrol", "--configfile="+smbConf, t.ServerID.Pid, "close-share", t.Service))
+	var closes []smbCloseCmd
+	for _, t := range tcons {
+		if services[t.Service] && !ok[t.Service+" "+t.Machine] {
+			closes = append(closes, smbCloseCmd{service: t.Service, pid: t.ServerID.Pid})
 		}
 	}
-	return errors.Join(errs...)
+	return closes
+}
+
+// closeShares ends the tree connects in closes through closeFn. A close
+// that fails — most often an smbd child that has already exited, its
+// tcon record not yet swept — is logged and left: the outcome is the
+// one wanted, so one dead child does not fail this round's drives.
+func closeShares(closes []smbCloseCmd, closeFn func(service, pid string) error) {
+	for _, c := range closes {
+		if err := closeFn(c.service, c.pid); err != nil {
+			log.Printf("drives: smbcontrol close-share %s %s: %v", c.service, c.pid, err)
+		}
+	}
 }
 
 // smbUsers makes users, by name, our smbd's, with their passwords, each a

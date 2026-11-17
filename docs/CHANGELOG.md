@@ -14,6 +14,7 @@ One section per release, newest first. An `-rc` tag ships the section of the rel
 - Terminal app: `/model` lists the models of a local server under Custom, after the catalog's models. The list comes from the server itself (`GET /providers/{name}/models`, for `openai-chat` providers the catalog does not have). A provider's new `context_limit` in the config is the context limit of sessions on its models, 30,000 when unset
 - Catalog: Gemini 4 Carbon on Google and OpenRouter
 - Releases are built with Go 1.27.4, which fixes GO-2026-6859 in net/http
+- Drives: the drive server no longer tears down a Windows client's `IPC$` tree connect each reconcile round. `smbClose` was revoking every tree connect `smbstatus` reported that was not in the desired drive exports, and `IPC$` — which every Windows client opens for named-pipe traffic (DFS referrals, `srvsvc` share enumeration, LSA lookups) — can never be one of them, so it was force-closed every 10 s and in-flight named-pipe work died with `NT_STATUS_NETWORK_NAME_DELETED`. Now only tree connects to a share the server still exports, from a client no longer among its SMB users, are revoked; `IPC$` and anything else `smbd` auto-registers is left alone. A `smbcontrol close-share` against an `smbd` child that has just exited (a stale tcon record) is logged rather than returned, so one dead child no longer marks every served drive `Failed` for the round
 
 ## v0.5.13
 
