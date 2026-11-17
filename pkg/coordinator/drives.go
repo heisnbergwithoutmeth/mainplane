@@ -16,6 +16,14 @@ import (
 // one is named, so a throwaway machine never gets files by default.
 const everyone = "*"
 
+// A drive server is Debian or Ubuntu, and shadow-utils up to 4.13 (Debian ≤
+// 12, Ubuntu ≤ 24.04, all current LTS families the requirement admits) takes
+// a Linux user name of 32 bytes at most. A worker name from a hostname's
+// first label can reach 63, and the uniqueness suffixes add more, so an SMB
+// user we derive from one stays under the worst case: useradd on the host a
+// Windows client lands on never rejects it.
+const maxSMBUser = 32
+
 // Drive is one drive in the harness config: the Linux worker that serves it
 // and the workers that mount it. Sessions takes no server: admin serves it.
 type Drive struct {
@@ -128,6 +136,14 @@ func (c *Coordinator) smb(s, n *node) *worker.SMB {
 	}
 	h := hmac.New(sha256.New, c.secret)
 	h.Write([]byte(s.Name + "/" + n.Name))
+	pw := hex.EncodeToString(h.Sum(nil))
 	// A Linux user's name starts with a letter, and a worker's need not.
-	return &worker.SMB{User: "mp-" + n.Name, Password: hex.EncodeToString(h.Sum(nil))}
+	// One longer than useradd accepts is the same HMAC, tagged so it shares
+	// no bytes with the password, hex and clipped to the bound above.
+	u := "mp-" + n.Name
+	if len(u) > maxSMBUser {
+		h.Write([]byte("user"))
+		u = "mp-" + hex.EncodeToString(h.Sum(nil))[:maxSMBUser-3]
+	}
+	return &worker.SMB{User: u, Password: pw}
 }
