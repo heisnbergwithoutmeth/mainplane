@@ -42,12 +42,19 @@ var lettersFile = filepath.Join(stateDir, "drives.json")
 var netUseLine = regexp.MustCompile(`(?m)\s([A-Z]:)\s+(\\\\\S+)`)
 
 // mapped is a drive this worker maps: its letter, its server's long name,
-// and whether it was ever mapped. Until then, a map that fails waits: the
-// harness tells the server and this worker at once.
+// whether it was ever mapped, and the SMB user/password cmdkey last stored
+// for its host (User, Pass). The harness changes both with a worker's name —
+// a Windows worker mounting through the * rule keeps its mapping across a
+// rename — so mount compares them to the frame and re-runs cmdkey when they
+// differ, the compare-and-apply the Linux serving side does in smbUsers.
+// Until a map succeeds it waits: the harness tells the server and this
+// worker at once.
 type mapped struct {
 	Letter string `json:"letter"`
 	Host   string `json:"host"`
 	Mapped bool   `json:"mapped"`
+	User   string `json:"user,omitempty"`
+	Pass   string `json:"pass,omitempty"`
 }
 
 // reconcile maps what want says in the operator's logon session, where
@@ -122,6 +129,20 @@ func mount(m Mount, ours map[string]mapped, at map[string]string, op *user.User)
 		d.Error = err.Error()
 		return d
 	}
+	// A credential already stored with this mapping is re-stored when the
+	// harness rotates the SMB user/password (a worker rename under the *
+	// rule changes both): cmdkey keeps the old one while the mapping
+	// stays, and a later session break re-authenticates with the deleted
+	// user. The Linux serving side does the same compare-and-apply in
+	// smbUsers's smbSet; both ends take the changed frame.
+	if o.User != m.SMB.User || o.Pass != m.SMB.Password {
+		if _, err := as(op, "cmdkey", "/add:"+m.Host, "/user:"+m.SMB.User, "/pass:"+m.SMB.Password); err != nil {
+			d.Error = err.Error()
+			return d
+		}
+		o.User, o.Pass = m.SMB.User, m.SMB.Password
+		ours[m.Name] = o
+	}
 	switch r := at[o.Letter]; {
 	case strings.EqualFold(r, remote) && !reach(m.Addr):
 		d.State, d.Error = Waiting, "server unreachable, the mapping waits for it"
@@ -132,10 +153,8 @@ func mount(m Mount, ours map[string]mapped, at map[string]string, op *user.User)
 	case !reach(m.Addr):
 		d.State, d.Error = Waiting, "server unreachable"
 	default:
-		if _, err := as(op, "cmdkey", "/add:"+m.Host, "/user:"+m.SMB.User, "/pass:"+m.SMB.Password); err != nil {
-			d.Error = err.Error()
-			return d
-		}
+		// The credential is stored above (one host's serves every drive on
+		// it), so this fresh mapping only needs the drive letter.
 		// Not persistent: Windows would map it at logon, before the mesh is
 		// up; this worker maps it once the operator is logged in.
 		_, err := as(op, "net", "use", o.Letter, remote, "/persistent:no")
@@ -205,9 +224,53 @@ func unmap(name string, o mapped, ours map[string]mapped, at map[string]string, 
 	return nil
 }
 
-// label sets the name Explorer shows for a mapping of \\host\share, in op's
-// own registry, to text alone, not "share (\\host)"; empty text takes it away.
-func label(op *user.User, host, share, text string) error {
+// as runs a program of System32 as op, in their logon session, where a
+// mapping and a credential are theirs; a worker run by hand is op already,
+// and only the service may take op's token. Its error names the program and
+// its first argument only, since cmdkey's carry the password, and has its
+// output on one line, for status.
+//
+// It is a package-level variable so the package's own test, built only on
+// Windows, can substitute a recorder that asserts the args without
+// running the real System32 binary; production never reassigns it.
+var as = realAs
+
+func realAs(op *user.User, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), mapWait)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, filepath.Join(os.Getenv("SystemRoot"), "System32", name+".exe"), args...)
+	if ok, _ := svc.IsWindowsService(); !ok {
+		op = nil
+	}
+	if err := prepare(cmd, op); err != nil {
+		return "", err
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("%s %s: %w: %s", name, args[0], err, strings.Join(strings.Fields(string(out)), " "))
+	}
+	return string(out), nil
+}
+
+// reach is whether a's SMB server takes a connection. A package-level
+// variable for the same test seam as as.
+var reach = realReach
+
+func realReach(a netip.Addr) bool {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(a.String(), smbPort), probeWait)
+	if err == nil {
+		_ = c.Close()
+	}
+	return err == nil
+}
+
+// label is a package-level variable for the same test seam as as.
+var label = realLabel
+
+// realLabel sets the name Explorer shows for a mapping of \\host\share, in
+// op's own registry, to text alone, not "share (\\host)"; empty text takes
+// it away.
+func realLabel(op *user.User, host, share, text string) error {
 	path := op.Uid + `\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##` + host + `#` + share
 	if text == "" {
 		k, err := registry.OpenKey(registry.USERS, path, registry.SET_VALUE)
@@ -256,37 +319,6 @@ func mappings(op *user.User) (map[string]string, error) {
 		at[m[1]] = m[2]
 	}
 	return at, nil
-}
-
-// as runs a program of System32 as op, in their logon session, where a
-// mapping and a credential are theirs; a worker run by hand is op already,
-// and only the service may take op's token. Its error names the program and
-// its first argument only, since cmdkey's carry the password, and has its
-// output on one line, for status.
-func as(op *user.User, name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), mapWait)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, filepath.Join(os.Getenv("SystemRoot"), "System32", name+".exe"), args...)
-	if ok, _ := svc.IsWindowsService(); !ok {
-		op = nil
-	}
-	if err := prepare(cmd, op); err != nil {
-		return "", err
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("%s %s: %w: %s", name, args[0], err, strings.Join(strings.Fields(string(out)), " "))
-	}
-	return string(out), nil
-}
-
-// reach is whether a's SMB server takes a connection.
-func reach(a netip.Addr) bool {
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(a.String(), smbPort), probeWait)
-	if err == nil {
-		_ = c.Close()
-	}
-	return err == nil
 }
 
 func load() map[string]mapped {
