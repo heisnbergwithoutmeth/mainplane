@@ -149,7 +149,7 @@ type ccFrame struct {
 // subscription, writes for 1 hour from the request start.
 func (e claudeCode) Compile(req Request) ([]byte, Cache, error) {
 	system, rest := Split(req.Context)
-	rest = fit(e.Name(), rest, anthLimits)
+	rest = fit(e.Name(), rest, anthLimits, images)
 	body := ccReq{Model: req.Model, System: systemText(system), Tools: []mcpTool{}}
 	if v, ok := req.Params["effort"]; ok {
 		if err := json.Unmarshal(v, &body.Effort); err != nil {

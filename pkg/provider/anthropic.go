@@ -111,7 +111,7 @@ var ephemeral = &anthCache{Type: "ephemeral", TTL: "1h"}
 // step with 10 or more parallel calls adds more than that.
 func (e anthropic) Compile(req Request) ([]byte, Cache, error) {
 	system, rest := Split(req.Context)
-	rest = fit(e.Name(), rest, anthLimits)
+	rest = fit(e.Name(), rest, anthLimits, images)
 	body := anthReq{Model: req.Model, Stream: true, Messages: []anthMsg{}}
 	mark := claude(req.Model)
 	var cache Cache

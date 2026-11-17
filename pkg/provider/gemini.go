@@ -107,7 +107,7 @@ type gemInline struct {
 
 func (e gemini) Compile(req Request) ([]byte, Cache, error) {
 	system, rest := Split(req.Context)
-	rest = fit(e.Name(), rest, gemLimits)
+	rest = fit(e.Name(), rest, gemLimits, geminiMedia)
 	body := gemReq{Contents: []gemContent{}}
 	if len(system) > 0 {
 		body.SystemInstruction = &gemContent{Parts: []gemPart{{Text: systemText(system)}}}
