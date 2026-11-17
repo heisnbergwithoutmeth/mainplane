@@ -275,7 +275,14 @@ func (h *Harness) CreateAgent(ctx context.Context, c AgentCreate, via string) (A
 		return a, fmt.Errorf("session %s is being stopped for a delete", c.Session)
 	}
 	h.agents[a.ID], h.live[c.Session] = a, a.ID
+	mu := &sync.Mutex{}
+	h.alocks[a.ID] = mu
+	mu.Lock()
 	h.amu.Unlock()
+	defer mu.Unlock()
+	if h.adoptHook != nil {
+		h.adoptHook()
+	}
 	if err = h.note(s, c.Session, system("apps", note)); err == nil {
 		err = h.save(a)
 	}
@@ -283,6 +290,7 @@ func (h *Harness) CreateAgent(ctx context.Context, c AgentCreate, via string) (A
 		h.lockAgents()
 		delete(h.agents, a.ID)
 		delete(h.live, c.Session)
+		delete(h.alocks, a.ID)
 		h.amu.Unlock()
 	}
 	return a, err
