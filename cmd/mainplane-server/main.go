@@ -61,11 +61,11 @@ func main() {
 	case verb == "up" && len(args) == 2:
 		fatal(server.Up(args[1]))
 	case verb == "install":
-		h, fresh, quick := config(args[1:])
+		h, fresh, quick, keep, file := config(args[1:])
 		fatal(h.Expand())
 		if !elevate.Is() {
 			var code int
-			if h, code = install(h); code != 0 {
+			if h, code = install(h, keep); code != 0 {
 				os.Exit(code)
 			}
 			if fresh { // the elevated install handed back; from a config file it printed itself
@@ -76,8 +76,6 @@ func main() {
 			return
 		}
 		stop := spin("installing mainplane-server")
-		// a plain install, the only one with a key yet, keeps the config there is
-		keep := h.Key != ""
 		err := server.Install(&h.Config, keep)
 		stop("")
 		fatal(err)
@@ -96,7 +94,7 @@ func main() {
 		if keep && !fresh { // an unelevated install handed over; hand back what it prints
 			b, err := json.Marshal(h)
 			fatal(err)
-			fatal(os.WriteFile(args[1], b, 0o600))
+			fatal(os.WriteFile(file, b, 0o600))
 			return
 		}
 		done(h)
@@ -136,14 +134,28 @@ type handover struct {
 // config is what install's arguments name: the default config with a fresh
 // key, with no pointer after --no-pointer, no admin worker after --no-admin,
 // reached at a URL after --url, or a config file; and whether the quickstart
-// opens after. The quickstart is the admin worker's CLI.
-func config(args []string) (h handover, fresh, quick bool) {
+// opens after. The quickstart is the admin worker's CLI. --handover marks a
+// file the unelevated install stage wrote to carry the install's key, harness
+// and join: only such a file may populate those, so a user file that carries
+// a top-level "key" cannot take the install's. --keep, the unelevated stage
+// passes for a plain install only, says install keeps the installed config;
+// the file is the path handed over, to write back the install's results.
+func config(args []string) (h handover, fresh, quick, keep bool, file string) {
 	if quick = len(args) > 0 && args[0] == "quickstart"; quick {
 		args = args[1:]
 	}
-	var noPointer, noAdmin bool
-	for ; len(args) > 0 && (args[0] == "--no-pointer" || args[0] == "--no-admin"); args = args[1:] {
-		noPointer, noAdmin = noPointer || args[0] == "--no-pointer", noAdmin || args[0] == "--no-admin"
+	var noPointer, noAdmin, handoverFile bool
+	for ; len(args) > 0 && (args[0] == "--no-pointer" || args[0] == "--no-admin" || args[0] == "--handover" || args[0] == "--keep"); args = args[1:] {
+		switch args[0] {
+		case "--no-pointer":
+			noPointer = true
+		case "--no-admin":
+			noAdmin = true
+		case "--handover":
+			handoverFile = true
+		case "--keep":
+			keep = true
+		}
 	}
 	if noAdmin && quick {
 		log.Fatal("--no-admin has no quickstart: the quickstart runs on the admin worker's CLI")
@@ -152,28 +164,33 @@ func config(args []string) (h handover, fresh, quick bool) {
 	case len(args) == 0:
 		h = handover{Config: server.Default(), Key: rand.Text()}
 		h.NoPointer, h.NoAdmin = noPointer, noAdmin
-		return h, true, quick
+		return h, true, quick, true, ""
 	case len(args) == 2 && args[0] == "--url":
-		h, fresh, _ = config(nil)
+		h, fresh, _, keep, _ = config(nil)
 		h.URL = harnessURL(args[1], "the URL your proxy carries to http://localhost:8080")
 		h.NoPointer, h.NoAdmin = noPointer, noAdmin
-		return h, fresh, quick
+		return h, fresh, quick, keep, ""
 	case len(args) == 1 && !quick && !noPointer && !noAdmin:
 		b, err := os.ReadFile(args[0])
 		fatal(err)
-		fatal(json.Unmarshal(b, &h))
-		return h, false, false
+		if handoverFile {
+			fatal(json.Unmarshal(b, &h))
+		} else {
+			fatal(json.Unmarshal(b, &h.Config))
+		}
+		return h, false, false, keep, args[0]
 	}
 	usage()
-	return h, false, false
+	return h, false, false, false, ""
 }
 
 // install hands the expanded config to an elevated install through a file
 // only this user may read, since neither sudo nor UAC carries this shell's
 // environment over, and reads the file back for the harness key it writes there. The
 // file is in a directory of its own: Linux refuses root a write to another
-// user's file in /tmp.
-func install(h handover) (handover, int) {
+// user's file in /tmp. The elevated install sees the file as a handover, and
+// --keep when this stage keeps the installed config: a plain install only.
+func install(h handover, keep bool) (handover, int) {
 	d, err := os.MkdirTemp("", "mainplane-server-*")
 	fatal(err)
 	defer func() { _ = os.RemoveAll(d) }()
@@ -181,10 +198,15 @@ func install(h handover) (handover, int) {
 	b, err := json.Marshal(h)
 	fatal(err)
 	fatal(os.WriteFile(f, b, 0o600))
-	if code := elevate.Run("install", f); code != 0 {
+	args := []string{"--handover"}
+	if keep {
+		args = append(args, "--keep")
+	}
+	args = append(args, f)
+	if code := elevate.Run(append([]string{"install"}, args...)...); code != 0 {
 		return h, code
 	}
-	h, _, _ = config([]string{f})
+	h, _, _, _, _ = config(args)
 	return h, 0
 }
 
