@@ -208,7 +208,9 @@ func start() error {
 // binary, and takes bin's folder off PATH once nothing else is in it. Dir
 // stays: it holds the sessions. The delete comes first: a harness that failed
 // moments before has a restart pending, which the service manager runs after
-// a stop, but not on a service marked for deletion.
+// a stop, but not on a service marked for deletion. A retry of Uninstall,
+// with the record already marked for deletion, has Delete itself reject; it
+// is tolerated so stop and the cleanup run.
 func Uninstall() error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -220,7 +222,7 @@ func Uninstall() error {
 		err = s.Delete()
 		_ = s.Close()
 	}
-	if err != nil && !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+	if err != nil && !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
 		return err
 	}
 	if err := stop(); err != nil {
@@ -266,6 +268,9 @@ func remove(f string) error {
 }
 
 // stop stops the service and waits until it has; none installed is stopped.
+// A service still starting has ControlsAccepted = 0, so its stop is rejected;
+// it is waited for to reach Running, or to end and be Stopped, before stopping
+// it as for one that was Running all along.
 func stop() error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -280,9 +285,37 @@ func stop() error {
 		return err
 	}
 	defer func() { _ = s.Close() }()
-	st, err := s.Control(svc.Stop)
-	if errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
-		return nil
+	st, err := s.Query()
+	if err != nil || st.State == svc.Stopped {
+		return err
+	}
+	if st.State == svc.StartPending {
+		// A START_PENDING service accepts no controls, so its stop is
+		// rejected; wait for Running, or for it to end and be Stopped,
+		// before stopping it.
+		end := time.Now().Add(stopWait)
+		for st.State == svc.StartPending {
+			if time.Now().After(end) {
+				return fmt.Errorf("%s did not start in %s", name, stopWait)
+			}
+			time.Sleep(200 * time.Millisecond)
+			if st, err = s.Query(); err != nil {
+				return err
+			}
+		}
+		if st.State == svc.Stopped {
+			return nil
+		}
+	}
+	st, err = s.Control(svc.Stop)
+	if errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) ||
+		errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) ||
+		errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+		// The service rejected the stop after we polled it Running; it
+		// transitioned between the poll and the control. Fall back to
+		// polling Query, as for a stop we sent, since the rejection
+		// means we have nothing else to send.
+		err = nil
 	}
 	for end := time.Now().Add(stopWait); err == nil && st.State != svc.Stopped; st, err = s.Query() {
 		if time.Now().After(end) {

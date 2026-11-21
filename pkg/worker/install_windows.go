@@ -249,7 +249,12 @@ func Uninstall() error {
 	// Deleted first: a worker that failed moments before has a restart
 	// pending, which the service manager runs after a stop, but not on a
 	// service marked for deletion. The service takes controls in order, so
-	// the stop waits for the drop.
+	// the stop waits for the drop. A service still starting, plus its
+	// seconds-long mesh.Up, has ControlsAccepted = 0, so the drop is
+	// rejected; a retry of Uninstall, with the record already marked for
+	// deletion, has Delete itself rejected. Both clear -- a started service
+	// stops, and a stopped service's record disappears -- so stop and the
+	// cleanup run either way; a retry is what reaches the second case.
 	s, err := m.OpenService(name)
 	if err == nil {
 		if err = s.Delete(); err == nil {
@@ -257,7 +262,12 @@ func Uninstall() error {
 		}
 		_ = s.Close()
 	}
-	if err != nil && !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+	if err != nil &&
+		!errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) &&
+		!errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) &&
+		!errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) &&
+		!errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) &&
+		!errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
 		return err
 	}
 	// so the worker logs out as it stops: see leave
@@ -379,8 +389,10 @@ func register() error {
 }
 
 // stop stops the service and waits until its process has ended, which can be
-// a moment after it reports stopped; until then its log is open. None
-// installed is stopped.
+// a moment after it reports stopped; until then its log is open. A service
+// still starting has ControlsAccepted = 0, so its stop is rejected; it is
+// waited for to reach Running or to end and be Stopped before stopping it as
+// for one that was Running all along. None installed is stopped.
 func stop() error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -399,6 +411,25 @@ func stop() error {
 	if err != nil || st.State == svc.Stopped {
 		return err
 	}
+	if st.State == svc.StartPending {
+		// A START_PENDING service accepts no controls and its process may
+		// not be one to wait on yet, so poll until Running or Stopped
+		// before issuing the stop; the cleanup that follows is unreachable
+		// while the SCM reports it starting.
+		end := time.Now().Add(stopWait)
+		for st.State == svc.StartPending {
+			if time.Now().After(end) {
+				return fmt.Errorf("%s did not start in %s", name, stopWait)
+			}
+			time.Sleep(200 * time.Millisecond)
+			if st, err = s.Query(); err != nil {
+				return err
+			}
+		}
+		if st.State == svc.Stopped {
+			return nil
+		}
+	}
 	p, err := windows.OpenProcess(windows.SYNCHRONIZE, false, st.ProcessId)
 	if err != nil {
 		// it may have ended between the query and the open
@@ -408,7 +439,10 @@ func stop() error {
 		return err
 	}
 	defer func() { _ = windows.CloseHandle(p) }()
-	if _, err := s.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+	if _, err := s.Control(svc.Stop); err != nil &&
+		!errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) &&
+		!errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) &&
+		!errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
 		return err
 	}
 	ev, err := windows.WaitForSingleObject(p, uint32(stopWait.Milliseconds()))
