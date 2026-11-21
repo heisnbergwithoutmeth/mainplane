@@ -49,7 +49,7 @@ Tools:
 - One run call is bounded at 10 minutes, or at its timeout argument in seconds. On timeout or crash, the next run's output begins with "environment was reset"
 - A run with background true is a job. Its result is at once: "started job <call id> on <worker>, pid <pid>, log <scratch>/jobs/<call id>.log". The job runs in a new interpreter process with no state from the persistent one and no timeout, its output going to the log
 - A job ends when its code finishes, and then its processes are killed. To keep a server up, keep the code running in the foreground (in js: await new Promise(() => {}))
-- When a job exits, a message via job arrives with its exit code, time, and the tail of its log
+- When a job exits, a message via job arrives with its exit code, time, and the tail of its log. If the tail is over the limits, the message says how many lines were cut and points to the log for the whole
 - If the harness loses contact with a job, it may or may not still be running; the log's last line is [exit N] when it ended. A note says so, but it does not wake you: it comes with the next message
 - Cancel a job by killing its process group: kill -- -<pid> on linux and macOS, taskkill /T /F /PID <pid> on Windows. A stop of the session kills all of its jobs and environments, and sends no message for them
 - A run result over 50 KiB or 2000 lines keeps its tail. The full output goes to a file, and the first line names its path, which will look like: <scratch>/output/<call id>

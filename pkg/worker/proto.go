@@ -75,6 +75,7 @@ type Header struct {
 
 	Exit int    `json:"exit,omitempty"` // result
 	Full string `json:"full,omitempty"` // result: file holding all the output, when over the limits
+	Cut  int    `json:"cut,omitempty"`  // result of a job: the lines the worker's tail clamp dropped before the body
 
 	Name        string   `json:"name,omitempty"`         // what sessions call this worker: its mesh name, set by the harness
 	OS          string   `json:"os,omitempty"`           // hello

@@ -577,8 +577,12 @@ func (h *Harness) job(ctx context.Context, id, call string, w Worker, a args) st
 			}
 			return
 		}
-		tail, _ := clip(o.Body, true)
+		tail, cut := clip(o.Body, true)
+		cut += o.Cut
 		text := fmt.Sprintf("[job %s on %s exited %d after %s. Log: %s]\n%s", call, a.Worker, o.Exit, time.Since(start).Round(time.Second), o.Full, tail)
+		if cut > 0 {
+			text = fmt.Sprintf("[job %s on %s exited %d after %s. Log: %s. %d lines cut]\n%s", call, a.Worker, o.Exit, time.Since(start).Round(time.Second), o.Full, cut, tail)
+		}
 		if _, err := h.Post(ctx, id, "job", call, []Part{{Type: "text/plain", Body: []byte(text)}}); err != nil {
 			log.Printf("session %s: job %s: %v", id, call, err)
 		}

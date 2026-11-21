@@ -270,7 +270,7 @@ func (r *Remote) Job(ctx context.Context, session, interpreter, code, job string
 			case worker.Started:
 				started <- f
 			case worker.Result:
-				o.Body, o.Exit, o.Full = f.Body, f.Exit, f.Path
+				o.Body, o.Exit, o.Full, o.Cut = f.Body, f.Exit, f.Path, f.Cut
 			case worker.Done:
 				stopped = true
 			}
