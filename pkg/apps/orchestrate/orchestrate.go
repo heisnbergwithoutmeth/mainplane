@@ -138,12 +138,12 @@ func New(ctx context.Context, h *harness.Harness, dir string) (*App, error) {
 		return nil
 	})
 	owned("PUT /agents/{id}/name", nil)
-	owned("PUT /agents/{id}/config", func(r *http.Request, caller, a harness.Agent) error {
+	owned("PUT /agents/{id}/config", func(r *http.Request, caller, _ harness.Agent) error {
 		var c harness.AgentConfig
 		if err := peek(r, &c); err != nil {
 			return err
 		}
-		return within(caller, &c, a.Apps)
+		return within(caller, &c, nil) // apps cannot change via this route; only the config's workers need checking
 	})
 	owned("PUT /agents/{id}/apps", func(r *http.Request, caller, _ harness.Agent) error {
 		var apps []string

@@ -559,6 +559,73 @@ func TestOrchestrateRoutes(t *testing.T) {
 	r.want(404, key, "DELETE", c, "")
 }
 
+// A PUT /agents/{id}/config validates only the workers the request names, not
+// the child's current apps: the route cannot change apps, so an operator
+// narrowing the caller's apps must not lock it out of editing a child that
+// still holds an app the caller lost. Re-granting that app to the child still
+// fails via PUT /agents/{id}/apps, as before.
+func TestOrchestrateConfigIgnoresChildApps(t *testing.T) {
+	r := newRig(t)
+	a := r.agent(conf("w1"), "orchestrate", "message")
+	key, u := r.key(a), "/apps/orchestrate/agents"
+	var first, second struct{ ID, Session string }
+	if err := json.Unmarshal([]byte(r.want(200, key, "POST", u, `{"name":"first","apps":["message"],"message":"the task"}`)), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(r.want(200, key, "POST", u, `{"name":"second","apps":["message"],"message":"the task"}`)), &second); err != nil {
+		t.Fatal(err)
+	}
+	r.settled(first.ID)
+	r.settled(second.ID)
+	cf, cs := u+"/"+first.ID, u+"/"+second.ID
+
+	// baseline: a config PUT works while the child has the caller's apps
+	same, _ := json.Marshal(conf("w1"))
+	r.want(204, key, "PUT", cf+"/config", string(same))
+
+	// an operator narrows the caller's own apps; the children still have message
+	if err := r.h.SetAgentApps(a.ID, "test", []string{"orchestrate"}); err != nil {
+		t.Fatal(err)
+	}
+	parent, _ := r.h.Agent(a.ID)
+	if !slices.Equal(parent.Apps, []string{"orchestrate"}) {
+		t.Fatalf("caller apps after narrow: %v", parent.Apps)
+	}
+
+	// formerly 403: the child's "message" was checked against the caller, who
+	// lost it; the config route cannot change apps, so it checks none
+	r.want(204, key, "PUT", cf+"/config", string(same))
+
+	// the child's apps are unchanged: config PUT touched no app list
+	child, err := r.h.Agent(first.ID)
+	if err != nil || !slices.Equal(child.Apps, []string{"message"}) {
+		t.Fatalf("config PUT changed the child's apps: %+v %v", child, err)
+	}
+
+	// a narrowing change the caller is entitled to also works: drop the worker
+	drop, _ := json.Marshal(conf())
+	r.want(204, key, "PUT", cf+"/config", string(drop))
+
+	// escalation on the requested config still triggers 403, by its worker
+	add, _ := json.Marshal(conf("w1", "w2"))
+	r.want(403, key, "PUT", cf+"/config", string(add))
+
+	// the apps route still checks the requested list, not the child's current
+	// one: re-granting the lost app fails, narrowing succeeds, and the lost
+	// app cannot come back — the irreversibility the bug report describes
+	r.want(403, key, "PUT", cf+"/apps", `["message"]`)
+	r.want(204, key, "PUT", cf+"/apps", `[]`)
+	r.want(403, key, "PUT", cf+"/apps", `["message"]`)
+
+	// the second child still has message; a config PUT on it succeeds too
+	r.want(204, key, "PUT", cs+"/config", string(same))
+
+	// a child with apps the caller lost can still be deleted, as before:
+	// DELETE checks only that the caller created the child
+	r.want(204, key, "DELETE", cs, "")
+	r.want(404, key, "GET", cs, "")
+}
+
 // A create that fails after its agent was made leaves no agent, no session
 // and no watch: the caller was told no, and may try again.
 func TestCreateUndone(t *testing.T) {
