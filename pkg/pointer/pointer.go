@@ -184,6 +184,9 @@ func Find(ctx context.Context, key, cached string) (string, error) {
 	}
 	var r record
 	if err := get(ctx, api+key, &r); err != nil {
+		if errors.Is(err, errNotFound) {
+			return "", fmt.Errorf("no harness is published for this key: the harness is gone, or it has not reached the pointer for 30 days")
+		}
 		return "", err
 	}
 	if err := verify(key, recordMsg(key, r.URL, r.Seq), r.Sig); err != nil {
