@@ -27,9 +27,11 @@ import (
 
 // turn is what the test's model answers a step with: a run of code on w1,
 // or with no code the text "ok" and the turn's end. input is the prompt's
-// size as the step reports it, ttl how long its prompt cache lasts.
+// size as the step reports it, ttl how long its prompt cache lasts. bg makes
+// the run a background job.
 type turn struct {
 	code       string
+	bg         bool
 	input, ttl int
 }
 
@@ -48,6 +50,16 @@ type rig struct {
 	started chan struct{}          // a run of "wait" began
 	release chan struct{}          // closed to let it end
 	writes  sync.WaitGroup         // w1's read loop, and the files it is writing under dir
+
+	// jobBody, jobExit, and jobCut are what w1 sends as a background job's
+	// Result: the log tail, its exit code, and the lines the worker's tail
+	// clamp dropped before the tail. jobLoseContact sends Started then closes
+	// the connection (no Result), so the harness posts the lost-contact
+	// system record.
+	jobBody        []byte
+	jobExit        int
+	jobCut         int
+	jobLoseContact bool
 }
 
 func newRig(t *testing.T) *rig {
@@ -67,7 +79,11 @@ func newRig(t *testing.T) *rig {
 			return hdr, nil
 		}
 		hdr.Stop = "tool_use"
-		emit(statefile.Record{Header: statefile.Header{Kind: statefile.Call, Type: "application/json"}, Body: fmt.Appendf(nil, `{"name":"run","arguments":{"worker":"w1","interpreter":"bash","code":%q}}`, tn.code)})
+		bg := ""
+		if tn.bg {
+			bg = `,"background":true`
+		}
+		emit(statefile.Record{Header: statefile.Header{Kind: statefile.Call, Type: "application/json"}, Body: fmt.Appendf(nil, `{"name":"run","arguments":{"worker":"w1","interpreter":"bash","code":%q%s}}`, tn.code, bg)})
 		return hdr, nil
 	}
 	r.h = &Harness{
@@ -134,6 +150,22 @@ func (r *rig) serve(conn net.Conn) {
 			event := f.Kind + " " + f.Session + f.Path
 			switch f.Kind {
 			case worker.Run:
+				if f.Job != "" {
+					r.mu.Lock()
+					body, exit, cut, lose := r.jobBody, r.jobExit, r.jobCut, r.jobLoseContact
+					r.mu.Unlock()
+					path := "/scratch/jobs/" + f.Job + ".log"
+					send(worker.Frame{Header: worker.Header{ID: f.ID, Kind: worker.Started, Pid: 1234, Path: path}})
+					if lose {
+						_ = conn.Close() // lost contact: no Result, connection dead
+						return
+					}
+					send(worker.Frame{Header: worker.Header{ID: f.ID, Kind: worker.Result, Exit: exit, Path: path, Cut: cut}, Body: body})
+					r.mu.Lock()
+					r.events = append(r.events, "job "+f.Job)
+					r.mu.Unlock()
+					return
+				}
 				if string(f.Body) == "wait" {
 					r.started <- struct{}{}
 					<-r.release

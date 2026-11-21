@@ -23,9 +23,11 @@ type job struct {
 
 // job runs code as a background job: in an interpreter of its own, under no
 // timeout, its output in <scratch>/jobs/<id>.log. It answers started at once,
-// and the result with the log's tail when the code finishes. Then the job's
-// processes are killed, so a job leaves nothing behind. The log ends with
-// "[exit N]", or "[stopped]" for a job a kill ended, which answers done.
+// and the result with the log's tail when the code finishes. The tail keeps the
+// last MaxBytes once over twice that, dropping whole lines off the front and
+// counting them in Cut; the harness clips it further and announces the total.
+// Then the job's processes are killed, so a job leaves nothing behind. The log
+// ends with "[exit N]", or "[stopped]" for a job a kill ended, which answers done.
 func (s *server) job(f Frame, it interp) (Frame, error) {
 	path := filepath.Join(s.Scratch, "jobs", f.Job+".log")
 	w, err := s.create(path)
@@ -60,9 +62,22 @@ func (s *server) job(f Frame, it interp) (Frame, error) {
 		return Frame{}, err
 	}
 	var tail []byte
+	var cut int
+	mid := false // the tail starts inside a line already counted
 	exit, _, err := e.run(context.Background(), string(f.Body), "mp-done-"+f.ID, func(b []byte) error {
 		if tail = append(tail, b...); len(tail) > 2*MaxBytes {
-			tail = bytes.Clone(tail[len(tail)-MaxBytes:])
+			drop := len(tail) - MaxBytes
+			if i := bytes.IndexByte(tail[drop:len(tail)-1], '\n'); i >= 0 {
+				drop += i + 1
+			}
+			cut += bytes.Count(tail[:drop], []byte("\n"))
+			if mid {
+				cut--
+			}
+			if mid = tail[drop-1] != '\n'; mid {
+				cut++
+			}
+			tail = bytes.Clone(tail[drop:])
 		}
 		_, err := w.Write(b)
 		return err
@@ -85,7 +100,7 @@ func (s *server) job(f Frame, it interp) (Frame, error) {
 	if err := w.Close(); err != nil {
 		return Frame{}, err
 	}
-	return Frame{Header: Header{Kind: Result, Exit: exit, Path: path}, Body: tail}, nil
+	return Frame{Header: Header{Kind: Result, Exit: exit, Path: path, Cut: cut}, Body: tail}, nil
 }
 
 // killJobs ends every job of a session.
